@@ -1,5 +1,7 @@
+import inspect
 import time
-from typing import Type, Any, Iterator
+from functools import lru_cache
+from typing import Type, Any, Iterator, Dict, List, Optional, Tuple
 
 import requests
 
@@ -59,6 +61,30 @@ class AmoCrmCompaniesMoreThanOne(Exception):
     """
 
 
+@lru_cache(maxsize=None)
+def api_fields(entity_cls: type) -> Tuple[str, ...]:
+    return tuple(name for name in inspect.signature(entity_cls.__init__).parameters if name != 'self')
+
+
+def custom_fields_by_name(custom_fields: Optional[List[Dict]]) -> Dict[str, Dict]:
+    """API отдаёт список полей или null, сущности работают со словарём {имя: {id, value}}."""
+    return {
+        field['field_name']: {
+            'id': field.get('field_id'),
+            'value': field['values'][0].get('value') if field.get('values') else None,
+        }
+        for field in custom_fields or []
+    }
+
+
+class EntitySchema:
+    def __init__(self, entity_cls: Type['BaseEntity']):
+        self.entity_cls = entity_cls
+
+    def load(self, items: List[Dict]) -> List['BaseEntity']:
+        return [self.entity_cls.from_api(item) for item in items]
+
+
 class BaseEntity:
     """
     base class for entity
@@ -68,6 +94,19 @@ class BaseEntity:
     url = None
     custom_fields_values = None
     PATCH_FIELDS = None
+
+    @classmethod
+    def get_schema(cls, many: bool = True) -> EntitySchema:
+        return EntitySchema(cls)
+
+    @classmethod
+    def from_api(cls, item: Dict) -> 'BaseEntity':
+        values = {name: item[name] for name in api_fields(cls) if name in item}
+        values['custom_fields_values'] = custom_fields_by_name(item.get('custom_fields_values'))
+        return cls(**values)
+
+    def as_dict(self) -> Dict:
+        return {name: getattr(self, name) for name in api_fields(type(self))}
 
     def __str__(self):
         return f"<{type(self).__name__}: {self.name}, {self.id}>"
@@ -106,23 +145,23 @@ class Customer(BaseEntity):
 
     def __init__(self,
                  id,
-                 name,
-                 next_price,
-                 next_date,
-                 responsible_user_id,
-                 status_id,
-                 periodicity,
-                 created_by,
-                 updated_by,
-                 created_at,
-                 updated_at,
-                 closest_task_at,
-                 is_deleted,
-                 ltv,
-                 purchases_count,
-                 average_check,
-                 account_id,
-                 custom_fields_values,
+                 name=None,
+                 next_price=None,
+                 next_date=None,
+                 responsible_user_id=None,
+                 status_id=None,
+                 periodicity=None,
+                 created_by=None,
+                 updated_by=None,
+                 created_at=None,
+                 updated_at=None,
+                 closest_task_at=None,
+                 is_deleted=None,
+                 ltv=None,
+                 purchases_count=None,
+                 average_check=None,
+                 account_id=None,
+                 custom_fields_values=None,
                  _embedded=None
                  ):
         self.id = id
@@ -142,7 +181,7 @@ class Customer(BaseEntity):
         self.purchases_count = purchases_count
         self.average_check = average_check
         self.account_id = account_id
-        self.custom_fields_values = custom_fields_values
+        self.custom_fields_values = custom_fields_values or {}
         self._embedded = _embedded
 
         self.companies = []
@@ -200,13 +239,16 @@ class Lead(BaseEntity):
         self.is_deleted = is_deleted
         self.score = score
         self.account_id = account_id
-        self.custom_fields_values = custom_fields_values
+        self.custom_fields_values = custom_fields_values or {}
         self._embedded = _embedded
         self.tags = []
         self.contacts = []
         self.companies = []
         if not _embedded:
             return
+        self.tags = _embedded.get(TAGS) or []
+        self.contacts = _embedded.get(CONTACTS) or []
+        self.companies = _embedded.get(COMPANIES) or []
 
 
 def amocrm_get(obj_cls: Type[BaseEntity],
@@ -257,14 +299,12 @@ def amocrm_get(obj_cls: Type[BaseEntity],
                 except AmoCrmNoConten:
                     raise
                 except Exception as e:
-                    raise AmoCrmError(f"[!] {response.status_code if response else '<No code!>'} |"
+                    raise AmoCrmError(f"[!] {response.status_code if response is not None else '<No code!>'} |"
                                       f" Неожиданная AMOCRM ошибка {e} ") from e
         except AmoCrmNoConten:
             break
         if json_data is not None:
-            counter = 0
             for entity in schema.load(json_data['_embedded'][entity_name]):
-                counter += 1
                 skip_entity = False
                 if custom_filter:
                     # if custom filter is not None then check custom field,
@@ -283,11 +323,13 @@ def amocrm_get(obj_cls: Type[BaseEntity],
             # condition to stop while loop
             if page:
                 break
-            if counter < limit:
+            # только next: короткая страница не значит конец, иначе обрезанная выгрузка выглядит полной
+            next_link = json_data.get('_links', {}).get('next')
+            if not next_link:
                 break
             time.sleep(1)
             # reset url and params for page iteration
-            url = json_data['_links']['next']['href']
+            url = next_link['href']
             params = {}
 
 
